@@ -1,103 +1,277 @@
 <?php
+namespace frontend\controllers;
 
-namespace app\controllers;
-
+use common\models\Comments;
+use common\models\PostForm;
+use common\models\Posts;
+use common\models\Profiles;
 use Yii;
-use app\components\SiteComponent;
-use app\models\Category;
-use app\models\Post;
-use yii\helpers\Url;
-use app\models\ConsultForm;
-use app\models\Review;
-use yii\data\Pagination;
+use yii\data\ArrayDataProvider;
+use yii\filters\AccessControl;
+use yii\web\Controller;
+use yii\web\Response;
 
-class PostController extends SiteComponent
+
+/**
+ * Site controller
+ */
+class PostController extends Controller
 {
-
-    /**
-     * Главная страница статьи
-     * @param $categoryAlias
-     * @param $postAlias
-     * @return string
-     */
-     
-    /*
-    public function init()
+    public function actions()
     {
-		$this->view->blocks['header'] = '@app/views/layouts/_1column.php';
+        return [
+            'fast-post-upload' => [
+                'class' => '\trntv\filekit\actions\UploadAction',
+                'deleteRoute' => 'upload-delete'
+            ],
+            'upload-delete' => [
+                'class' => '\trntv\filekit\actions\DeleteAction',
+            ],
+        ];
     }
-    */
-    //$alone - не учитывать категорию
-    public function actionIndex($categoryAlias, $postAlias, $alone = FALSE)
+
+    public function behaviors()
     {
-        // Вытаскиваем категорию и статью
-		//exit();
-		$url = parse_url($_SERVER['REQUEST_URI']);
-		$url = explode('/', $url['path']);
-		array_pop($url);
-		array_shift($url);
+        return [
+            'rateLimiter' => [
+                'class' => \yii\filters\RateLimiter::className(),
+                'only' => ['update', 'create', 'create-fast-post', 'comment'],
+                'enableRateLimitHeaders' => false,
+                'errorMessage' => Yii::t('app', 'Request limit exceeded'),
+            ],
+            'access' => [
+                'class' => AccessControl::className(),
+                'rules' => [
+                    [
+                        'actions' => [
+                            'update',
+                            'create',
+                            'create-fast-post',
+                            'fast-post-upload',
+                            'upload-delete',
+                            'comment',
+                            'delete'
+                        ],
+                        'allow' => true,
+                        'roles' => ['@'],
+                    ],
+                    [
+                        'actions' => ['tile','load', 'view'],
+                        'allow' => true,
+                    ]
+                ],
+            ],
+        ];
+    }
 
-		$categoryAlias = implode('/', $url);
-
-        $category = $this->getCategoryByAlias($categoryAlias);
-        $post = Post::find()->where(['alias' => $postAlias, 'status' => 1])->one();
-
-        $model = new ConsultForm;
-          if (Yii::$app->request->post() && $model->load(Yii::$app->request->post())){              
-            $model->contact($this->settings->email);
-            Yii::$app->session->setFlash('consiltFormSubmitted','Спасибо ! Мы скоро свяжемся с вами !');
-            
-        }
-        $query = Review::find()->where(['status' => 1,'post_id'=>$post->id])->orderBy(['created_at'=> SORT_DESC]);
-       
-        $pagination = new Pagination([
-                'totalCount' => $query->count(),
-                'route'      => Url::toRoute('review/list'),
-                'pageSize'   => 5
+    public function actionUpdate($postId)
+    {
+        $post = Posts::findOne($postId);
+        if (!$post) {
+            return json_encode([
+                'message' => Yii::t('app', 'Post not found'),
+                'errors' => true
             ]);
-        $model      = $query->offset($pagination->offset)->limit($pagination->limit)->all();
-        
-        $model_new = new Review(['scenario' => 'default']);
-        $model_new->post_id = $post->id;
-
-        if ($model_new->load(Yii::$app->request->post())){
-            
-                $model_new->save();
-                $model_new->contact($this->settings->email);
-                //$model_new->contact('mzherikhova@mail.ru');
-                Yii::$app->session->setFlash('reviewFormSubmitted');
-                return $this->refresh();
-            
         }
-        
-        if (empty($category) || empty($post) ||
-			$category['id'] != $post['id_category']) throw new \yii\web\HttpException(404, 'Страница не найдена ');
-        
-        $this->setMetaTags($post->meta_title, $post->meta_keywords, $post->meta_description);
-	//'post.tpl'
-
-        return $this->render($post->template, [
-            'post'     => $post,
-            'category' => $category,
-            'alone' => $alone,
-            'model_new'=>$model_new,
-            'model' =>$model,
-            'pagination' => $pagination,
+        $model = new PostForm([
+            'header' => $post->header,
+            'header_tags' => $post->header_tags,
+            'postId' => $post->id,
+            'image' => $post->image,
+            'content' => $post->content,
+            'wall' => $post->wall_id
         ]);
 
+
+
+        if ($model->load(Yii::$app->request->post())) {
+            if ($model->validate()) {
+                $post->header = $model->header;
+                $post->image = $model->image;
+                $post->content = $model->content;
+                $post->header_tags = $model->header_tags;
+
+                // изменили стену, проверим может ли пользователь создавать посты на новой стене
+                if ($model->wall != $post->wall_id){
+                    $profile_wall = Profiles::findOne($model->wall);
+                    if (!isset($profile_wall) ||
+                        !Yii::$app->user->can('createPost', ['group'=>$profile_wall->name, 'profile_id'=>$profile_wall->id])){
+                        return json_encode(false);
+                    }
+                }
+                $post->wall_id = $model->wall;
+
+                if (!Yii::$app->user->can('updatePost', ['group'=>$post->wall->name, 'post_author'=>$post->author_id])){
+                    return json_encode([
+                        'message' => Yii::t('app', 'You can not edit this post'),
+                        'errors' => true
+                    ]);
+                }
+
+                $post->save();
+                return json_encode([
+                    'html' => $this->renderAjax('post_tile', ['model' => $post]),
+                    'postId' => $post->id,
+                    'message' => Yii::t('app', 'Post saved'),
+                    'updated' => true
+                ]);
+            } else {
+                return json_encode([
+                    'message' => $model->getFirstErrors(),
+                    'errors' => true
+                ]);
+            }
+
+        } else {
+            return $this->renderAjax('forms/full_post', ['model' => $model ]);
+        }
     }
 
-    /**
-     * Получение данных о категории
-     * @param $alias
-     * @return array|null|\yii\db\ActiveRecord
-     * @throws \yii\base\Exception
-     */
-    private function getCategoryByAlias($alias)
+    public function actionCreate()
     {
-        $category = Category::find()->where(['alias' => $alias, 'status' => 1])->one();
-        if ($category) {
-            return $category;
+        $request = Yii::$app->request;
+
+        $image = $request->post('image');
+        $wall_name = $request->post('wall_name');
+        $txt = $request->post('txt');
+        $header_tags = $request->post('header_tags');
+
+        $model = new PostForm();
+        if ($image) {
+            $model->image = $image;
         }
+        if ($wall_name) {
+            $wall = Profiles::findOne(['name'=>$wall_name]);
+            if (isset($wall))  $model->wall = $wall->id;
+
+        }
+        if ($txt) {
+            $model->content = $txt;
+        }
+        if ($header_tags) {
+            $model->header_tags = $header_tags;
+        }
+
+        if ($model->load(Yii::$app->request->post())) {
+            $profile_wall = Profiles::findOne($model->wall);
+            if (!isset($profile_wall) ||
+                !Yii::$app->user->can('createPost', ['group'=>$profile_wall->name, 'profile_id'=>$profile_wall->id])){
+                return json_encode(false);
+            }
+            $model->validate();
+            $post = $model->post();
+            if ($model->hasErrors()) {
+                return json_encode([
+                    'message' => $model->getFirstErrors(),
+                    'errors' => true
+                ]);
+            } else {
+                $post = Posts::findOne($post->id);
+                Profiles::communityBonus(Yii::$app->user->getId(), $post->wall_id, 'post', true, $post->id);
+                return json_encode([
+                    'html' => $this->renderAjax('post_tile', ['model' => $post]),
+                    'postId' => $post->id,
+                    'message' => Yii::t('app', 'Post added')
+                ]);
+            }
+        } else {
+            return $this->renderAjax('forms/full_post', ['model' => $model]);
+        }
+    }
+
+    public function actionDelete()
+    {
+        $id = Yii::$app->request->post('post_id');
+        $postModel = Posts::findOne($id);
+        if (isset($postModel) && Yii::$app->user->can('createPost', ['group'=>$postModel->wall->name, 'profile_id'=>$postModel->wall->id])){
+            Profiles::communityBonus($postModel->author_id, $postModel->wall_id, 'post', false, $postModel->id);
+            $postModel->delete();
+            return json_encode(true);
+        }
+        return json_encode(false);
+
+    }
+
+    public function actionCreateFastPost()
+    {
+        $model = new PostForm();
+        if ($model->load(Yii::$app->request->post())) {
+            $profile_wall = Profiles::findOne($model->wall);
+            if (!isset($profile_wall) ||
+                !Yii::$app->user->can('createPost', ['group'=>$profile_wall->name, 'profile_id'=>$profile_wall->id])){
+                return json_encode(false);
+            }
+
+            if (!$model->validate()) {
+                return json_encode([
+                    'status' => 'error',
+                    'message' => $model->getFirstError('content')
+                ]);
+            } else {
+                $post = $model->post();
+                if ($post) {
+                    $post = Posts::findOne($post->id);
+                    Profiles::communityBonus(Yii::$app->user->getId(), $post->wall_id, 'post', true, $post->id);
+                    return json_encode([
+                        'status' => 'ok',
+                        'html' => $this->renderPartial('post_tile', ['model' => $post, 'item_class'=>'createpost'])
+                    ]);
+                } else {
+                    return json_encode([
+                        'status' => 'error',
+                        'message' => Yii::t('app', 'Error')
+                    ]);
+                }
+            }
+        }
+    }
+
+    public function actionView($id, $commentId)
+    {
+        $model = Posts::findOne($id);
+        if (!empty($model) && !$model->is_hidden && !$model->wall->is_hidden && Yii::$app->user->can('viewGroup', ['group'=>$model->wall->name])) {
+            $comment = $model->getComments()->where(['id'=>$commentId])->one();
+            return $this->renderPartial('view',['model' => $model, 'comment'=> $comment]);
+        } else {
+            return $this->renderPartial('not_found');
+        }
+    }
+
+    public function actionComment($id)
+    {
+        $model = new Comments();
+        if ($model->load(Yii::$app->request->post())&&$model->validate()) {
+            if (!Yii::$app->user->can('viewGroup', ['group'=>$model->post->wall->name])){
+                $json['errors'] = Yii::t('app', 'Error - not permitted');
+            } else {
+                $model->save();
+                $profile = Posts::findOne($id);
+                Profiles::communityBonus(Yii::$app->user->getId(), $profile->wall_id, 'comment', true, $model->id);
+                $json['html'] = $this->renderPartial('/comment/view', [
+                    'comment' => Comments::findOne($model->id)
+                ]);
+            }
+        } else {
+            $json['errors'] = $model['errors'];
+        }
+        Yii::$app->response->format = Response::FORMAT_JSON;
+        return $json;
+    }
+
+    public function actionTile($id)
+    {
+        $model = Posts::findOne($id);
+        return $this->renderAjax('post_tile', ['model' => $model]);
+    }
+
+    public function actionLoad($wall = null, $offset)
+    {
+        $posts = Posts::getPagePosts($wall, $offset)->all();
+        return json_encode([
+            'posts' => $this->renderPartial('index', [
+                'posts' => $posts,
+            ]),
+            'feed_offset' => count($posts),
+        ]);
     }
 }
